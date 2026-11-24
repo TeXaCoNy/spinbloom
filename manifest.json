@@ -19,7 +19,7 @@
     "description": "Now playing with a round cover, quick controls, and a panel for search, queue, library and lyrics",
     "category": "Media",
     "allowMultiple": false,
-    "defaultSection": "centerBegin",
+    "defaultSection": "center",
     "defaults": {
       "barControls": true,
       "showTitle": false,
