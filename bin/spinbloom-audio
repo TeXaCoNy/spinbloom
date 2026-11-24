@@ -1,0 +1,122 @@
+#!/usr/bin/python3 -I
+"""spinbloom-audio: the music player's own output device, apart from the system's.
+
+    spinbloom-audio list            JSON: output devices, the default, the music's streams
+    spinbloom-audio set DEVICE      send the music (only) to DEVICE (a sink name)
+    spinbloom-audio set default     the music follows the computer's output again
+
+Only the player's engine is moved: its sound streams carry
+application.id=spinbloom (set by spinbloom-engine at launch), and
+WirePlumber remembers the device per application.id, so the user's own
+browser and every other app keep the computer's output. Uses pactl and
+pw-metadata, which ship with PipeWire.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+APP_ID = "spinbloom"
+ENGINE_MARK = "/spinbloom/engine"
+ENV = {"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", ""),
+       "HOME": os.environ.get("HOME", ""), "LANG": "C.UTF-8"}
+
+
+def run(*args):
+    return subprocess.run(args, capture_output=True, text=True, env=ENV, timeout=6)
+
+
+def pactl_json(*what):
+    r = run("pactl", "-f", "json", *what)
+    try:
+        return json.loads(r.stdout or "null")
+    except ValueError:
+        return None
+
+
+def label_of(sink):
+    desc = sink.get("description") or sink.get("name") or ""
+    m = re.search(r"\[([^\]]+)\]", desc)
+    if m:                                   # "… (HDMI) [LG TV SSCR2]" → "LG TV SSCR2"
+        return m.group(1).strip()
+    desc = re.sub(r"\s+(Analog|Digital)\s+Stereo.*$", "", desc)
+    desc = re.sub(r"\s+Stereo$", "", desc)
+    return desc.replace("_", " ").strip()
+
+
+def engine_pid(pid):
+    """Is pid (or one of its parents) the music engine's browser?"""
+    seen = 0
+    while pid and pid > 1 and seen < 12:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                if ENGINE_MARK.encode() in f.read():
+                    return True
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        seen += 1
+    return False
+
+
+def music_streams():
+    out = []
+    for s in pactl_json("list", "sink-inputs") or []:
+        p = s.get("properties") or {}
+        mine = p.get("application.id") == APP_ID
+        if not mine and p.get("application.process.binary") == "chromium":
+            try:
+                mine = engine_pid(int(p.get("application.process.id") or 0))
+            except ValueError:
+                mine = False
+        if mine:
+            out.append({"index": s["index"], "node": int(p.get("object.id") or 0), "sinkIndex": s.get("sink")})
+    return out
+
+
+def listing():
+    sinks = pactl_json("list", "sinks") or []
+    by_index = {s["index"]: s["name"] for s in sinks}
+    default = (run("pactl", "get-default-sink").stdout or "").strip()
+    streams = music_streams()
+    for st in streams:
+        st["sink"] = by_index.get(st.pop("sinkIndex"), "")
+    return {
+        "default": default,
+        "sinks": [{"name": s["name"], "label": label_of(s)} for s in sinks],
+        "streams": streams,
+    }
+
+
+def set_output(target):
+    streams = music_streams()
+    if target in ("", "default"):
+        for st in streams:
+            # Forget the music's own target: WirePlumber links it to the
+            # computer's default again (and keeps following it).
+            for key in ("target.object", "target.node"):
+                run("pw-metadata", "-d", str(st["node"]), key)
+            run("pactl", "move-sink-input", str(st["index"]), "@DEFAULT_SINK@")
+            for key in ("target.object", "target.node"):
+                run("pw-metadata", "-d", str(st["node"]), key)
+    else:
+        for st in streams:
+            run("pactl", "move-sink-input", str(st["index"]), target)
+    return {"ok": True, "moved": len(streams)}
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "list":
+        print(json.dumps(listing()))
+        return 0
+    if len(argv) >= 3 and argv[1] == "set":
+        print(json.dumps(set_output(argv[2])))
+        return 0
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

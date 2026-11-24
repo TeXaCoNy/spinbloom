@@ -1,0 +1,1304 @@
+// agent.js — the page side of Spinbloom.
+//
+// The bridge injects parse.js and this file into the hidden YouTube Music
+// page (the engine), on every new document and once into the current one.
+// It drives the web app through the app's own pieces: its player, its queue
+// store and its InnerTube API, with the page's own sign-in. Cookies never
+// leave the page.
+//
+// Changes are pushed, not polled: the bridge adds a DevTools binding
+// (window.__spinbloomEmit) and the agent calls it when the player, the queue or
+// the account changes. Once the page is up the only timer is the ad
+// watcher, which presses an advert's Skip button as soon as it appears.
+
+;(function () {
+  "use strict"
+
+  var VERSION = "%%SPINBLOOM_VERSION%%"
+  var EMIT = "__spinbloomEmit"
+  var HOST = "music.youtube.com"
+  var P = typeof SpinbloomParse !== "undefined" ? SpinbloomParse : null
+
+  // The bridge's script runs in every frame of the page; only the top one
+  // is the app. A frame (an advert's, say) must not speak for it.
+  try { if (window.top !== window) return } catch (e) { return }
+
+  // The engine's window sits on a hidden workspace, so the compositor asks
+  // it for no frames and requestAnimationFrame never fires, even though
+  // the page says it is visible. The player needs it to keep adding video
+  // to its buffer: without frames a song played with its video (as on a
+  // free account) stops where the first buffer ends, about 0:49, and play
+  // cannot start it again. A callback the compositor
+  // has not run within FRAME_MS is run from a timer instead. Once per
+  // document: the agent may be injected again into the same page.
+  if (location.hostname === HOST && !window.__spinbloomFrames) {
+    window.__spinbloomFrames = true
+    var FRAME_MS = 50
+    var nativeRaf = window.requestAnimationFrame.bind(window)
+    var nativeCaf = window.cancelAnimationFrame.bind(window)
+    var frames = {}
+    var nextFrame = 1
+    window.requestAnimationFrame = function (cb) {
+      var id = nextFrame++
+      var run = function (ts) {
+        if (!(id in frames)) return
+        var f = frames[id]
+        delete frames[id]
+        nativeCaf(f.raf)
+        clearTimeout(f.timer)
+        cb(typeof ts === "number" ? ts : performance.now())
+      }
+      frames[id] = { raf: nativeRaf(run), timer: setTimeout(run, FRAME_MS) }
+      return id
+    }
+    window.cancelAnimationFrame = function (id) {
+      var f = frames[id]
+      if (!f) return
+      delete frames[id]
+      nativeCaf(f.raf)
+      clearTimeout(f.timer)
+    }
+  }
+
+  var previous = window.__spinbloom
+  if (previous && previous.version === VERSION) return
+  // An agent from before the EQ graph was shared (window.__spinbloomEq): its
+  // stop() closes the graph, and a <video> it wrapped stays bound to that
+  // dead source for life, silent. Checked once the app is up (start()).
+  var fromUnsharedAgent = !!(previous && !previous.sharesEq)
+  if (previous && typeof previous.stop === "function") { try { previous.stop() } catch (e) { /* old agent is gone anyway */ } }
+
+  // ---------------------------------------------------------------- emit
+
+  function emit(type, data) {
+    try {
+      if (typeof window[EMIT] === "function") window[EMIT](JSON.stringify({ t: type, v: VERSION, data: data }))
+    } catch (e) { /* the bridge is not listening; nothing to do */ }
+  }
+
+  function fail(code) { var e = new Error(code); e.code = code; throw e }
+
+  // ---------------------------------------------------------------- page access
+
+  function app() { return document.querySelector("ytmusic-app") }
+
+  function store() {
+    var a = app()
+    var s = a && a.queue && a.queue.store
+    return s && typeof s.getState === "function" && typeof s.dispatch === "function" ? s : null
+  }
+
+  function appState() {
+    var s = store()
+    try { return s ? s.getState() : null } catch (e) { return null }
+  }
+
+  function player() {
+    var p = document.getElementById("movie_player")
+    return p && typeof p.getPlayerState === "function" ? p : null
+  }
+
+  function video() {
+    var p = document.getElementById("movie_player")
+    return (p && p.querySelector("video")) || document.querySelector("video")
+  }
+
+  // The advert's own Skip button, if the current advert has one to press.
+  // Matched by class substring rather than an exact list or its text: the
+  // pill's class has moved before (old ytp-ad-skip-button, then a "-modern"
+  // variant) and its label is localized, but "skip" inside an ad class name
+  // has not moved. A non-skippable advert (seen live: the first of a pair,
+  // with no button at all, not merely a hidden one) returns null.
+  function adSkipButton() {
+    var buttons = document.querySelectorAll(
+      ".ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern, " +
+      "[class*='ad-skip-button' i], [class*='skip-ad-button' i], [class*='skip-button' i]"
+    )
+    for (var i = 0; i < buttons.length; i++) {
+      var b = buttons[i]
+      if (b && shown(b)) return b
+    }
+    return null
+  }
+
+  // Laid out on the page. offsetParent alone is null for a position:fixed
+  // element even when it is on screen, so its boxes are asked as well.
+  function shown(el) {
+    if (el.offsetParent !== null) return true
+    return typeof el.getClientRects === "function" && el.getClientRects().length > 0
+  }
+
+  function pressSkip(b) {
+    if (typeof b.click === "function") b.click()
+    // A synthetic .click() is not always trusted by YouTube's ad player,
+    // so it can land on a button that is really there and do nothing.
+    // Ending the advert's own <video> is what a real Skip press does
+    // underneath, and it works whether or not the click did.
+    var v = video()
+    if (v && isFinite(v.duration) && v.duration > 0) v.currentTime = v.duration
+    schedule(false)
+  }
+
+  // While an advert plays, press its Skip button once a second until it is
+  // gone: the button only appears some seconds in, and a press can miss.
+  var AD_SKIP_MS = 1000
+
+  function autoSkipAd() {
+    var ps = (appState() || {}).player || {}
+    if (!ps.adPlaying) return
+    var b = adSkipButton()
+    if (b) { pressSkip(b); return }
+    // The Skip button appearing changes neither the store nor the <video>,
+    // so nothing else pushes it: without this the panel keeps its pill on
+    // "Can't skip yet" for the whole advert.
+    schedule(false)
+  }
+
+  function cfg(key) {
+    try { return window.ytcfg && typeof window.ytcfg.get === "function" ? window.ytcfg.get(key) : undefined } catch (e) { return undefined }
+  }
+
+  function signedIn() { return cfg("LOGGED_IN") === true }
+  // The page's own config says whether the account has Premium. Strictly
+  // true or nothing: a missing or odd value never shows a badge.
+  function premium() { return signedIn() && cfg("IS_SUBSCRIBER") === true }
+
+  function needStore() { var s = store(); if (!s) fail("no-queue"); return s }
+  function needPlayer() { var p = player(); if (!p) fail("no-player"); return p }
+  function needSignIn() { if (!signedIn()) fail("signin-required") }
+
+  // ---------------------------------------------------------------- InnerTube
+
+  function cookie(name) {
+    var parts = document.cookie ? document.cookie.split("; ") : []
+    for (var i = 0; i < parts.length; i++) {
+      var eq = parts[i].indexOf("=")
+      if (eq > 0 && parts[i].slice(0, eq) === name) return decodeURIComponent(parts[i].slice(eq + 1))
+    }
+    return ""
+  }
+
+  async function sha1hex(s) {
+    var buf = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(s))
+    return Array.prototype.map.call(new Uint8Array(buf), function (b) { return (b < 16 ? "0" : "") + b.toString(16) }).join("")
+  }
+
+  // POST /youtubei/v1/<endpoint>, as the web app does it. `mobile` asks as
+  // the Android app, anonymously: timed lyrics are only served to it.
+  async function innertube(endpoint, body, opts) {
+    opts = opts || {}
+    var ctx = cfg("INNERTUBE_CONTEXT")
+    if (!ctx) fail("not-ready")
+    var headers = { "Content-Type": "application/json" }
+    var credentials = "include"
+    if (opts.mobile) {
+      var client = ctx.client || {}
+      ctx = { client: { clientName: "ANDROID_MUSIC", clientVersion: "7.21.50", hl: client.hl || "en", gl: client.gl || "US" }, user: {} }
+      credentials = "omit"
+    } else {
+      ctx = JSON.parse(JSON.stringify(ctx))
+      headers["X-Youtube-Client-Name"] = String(cfg("INNERTUBE_CONTEXT_CLIENT_NAME") || 67)
+      headers["X-Youtube-Client-Version"] = String(cfg("INNERTUBE_CLIENT_VERSION") || "")
+      headers["X-Origin"] = location.origin
+      var visitor = cfg("VISITOR_DATA")
+      if (visitor) headers["X-Goog-Visitor-Id"] = String(visitor)
+      var sid = cookie("SAPISID") || cookie("__Secure-3PAPISID")
+      if (sid && signedIn()) {
+        var ts = Math.floor(Date.now() / 1000)
+        headers["Authorization"] = "SAPISIDHASH " + ts + "_" + (await sha1hex(ts + " " + sid + " " + location.origin))
+        headers["X-Goog-AuthUser"] = String(cfg("SESSION_INDEX") || 0)
+      }
+    }
+    var key = cfg("INNERTUBE_API_KEY")
+    var url = "/youtubei/v1/" + endpoint + "?prettyPrint=false" + (key ? "&key=" + encodeURIComponent(key) : "")
+    var ctrl = typeof AbortController === "function" ? new AbortController() : null
+    var timer = ctrl ? setTimeout(function () { ctrl.abort() }, opts.timeout || 12000) : null
+    try {
+      var res = await fetch(url, {
+        method: "POST", credentials: credentials, headers: headers,
+        body: JSON.stringify(Object.assign({ context: ctx }, body || {})),
+        signal: ctrl ? ctrl.signal : undefined
+      })
+      if (!res.ok) fail("http-" + res.status)
+      return await res.json()
+    } catch (e) {
+      if (e && e.name === "AbortError") fail("timeout")
+      throw e
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  // ---------------------------------------------------------------- player model
+
+  // The current queue entry, parsed (artists, album, cover).
+  function currentEntry(q) {
+    if (!q || !Array.isArray(q.items)) return null
+    var i = q.selectedItemIndex
+    var raw = i >= 0 && i < q.items.length ? q.items[i] : null
+    return raw && P ? P.panelVideo(raw, { thumbPx: 544 }) : null
+  }
+
+  var likeCache = Object.create(null)
+  var likeSession = ""
+  var likeRead = null
+  var likeWrites = 0
+  var likeRevision = 0
+  var stopped = false
+
+  function likeAccount() {
+    return signedIn() ? String(cfg("SESSION_INDEX") || 0) : ""
+  }
+
+  function syncTrackLike(videoId) {
+    var accountId = likeAccount()
+    if (accountId !== likeSession) {
+      likeSession = accountId
+      likeCache = Object.create(null)
+      likeRead = null
+    }
+    if (stopped || !P || !accountId || !videoId || likeWrites) return
+    if (likeRead && likeRead.videoId === videoId && Date.now() - likeRead.started < 30000) return
+    var request = { videoId: videoId, started: Date.now(), revision: likeRevision }
+    likeRead = request
+    innertube("next", { videoId: videoId, isAudioOnly: true }).then(function (data) {
+      if (stopped || likeRead !== request || likeAccount() !== accountId || request.revision !== likeRevision) return
+      var status = P.watchInfo(data).likeStatus
+      if (["LIKE", "DISLIKE", "INDIFFERENT"].indexOf(status) < 0) return
+      likeCache[videoId] = status
+      schedule(false)
+    }).catch(function () {
+      // Keep the last known state when YouTube Music cannot answer.
+    })
+  }
+
+  function likeOf(st, videoId) {
+    if (!videoId) return "INDIFFERENT"
+    var fromStore = st && st.likeStatus && st.likeStatus.videos ? st.likeStatus.videos[videoId] : undefined
+    return String((likeAccount() === likeSession && likeCache[videoId]) || fromStore || "INDIFFERENT")
+  }
+
+  // Spinbloom: the audio stream's format, for the player's quality badge.
+  // The player's own "stats for nerds" name the codec and its itag.
+  function audioInfo(p) {
+    try {
+      if (!p || typeof p.getStatsForNerds !== "function") return ""
+      var codecs = String((p.getStatsForNerds() || {}).codecs || "")
+      var m = codecs.match(/(opus|mp4a[\w.]*)\s*\((\d+)\)/i)
+      return m ? m[2] : ""
+    } catch (e) { return "" }
+  }
+
+  function snapshot() {
+    var p = player()
+    var v = video()
+    var st = appState() || {}
+    var ps = st.player || {}
+    var q = st.queue || {}
+    var data = p && typeof p.getVideoData === "function" ? (p.getVideoData() || {}) : {}
+    var cur = currentEntry(q)
+    var videoId = String(data.video_id || (cur && cur.videoId) || "")
+    // YouTube Music can play a song while its queue still marks another as
+    // current (a playlist or album started at a song in the middle). Use the
+    // queue's entry for the song that really plays, and once the two have
+    // disagreed for 2 s (not just mid-change), move the marker to it.
+    if (videoId && (!cur || cur.videoId !== videoId)) {
+      var found = playingEntryIndex(q, videoId)
+      if (found >= 0) {
+        cur = P ? P.panelVideo(q.items[found], { thumbPx: 544 }) : cur
+        if (!mismatchSince) mismatchSince = Date.now()
+        else if (Date.now() - mismatchSince > 2000) alignSelection(found)
+      }
+    } else {
+      mismatchSince = 0
+    }
+    var state = p ? p.getPlayerState() : -1
+    var ad = !!ps.adPlaying
+    var playing = ad ? !!(v && !v.paused) : state === 1
+    var matches = cur && cur.videoId === videoId
+    var items = Array.isArray(q.items) ? q.items.length : 0
+    var automix = Array.isArray(q.automixItems) ? q.automixItems.length : 0
+    return {
+      videoId: videoId,
+      title: String((matches && cur.title) || data.title || ""),
+      artists: matches ? cur.artists : (data.author ? [{ name: String(data.author), id: "" }] : []),
+      album: matches ? cur.album : null,
+      thumb: matches && cur.thumb ? cur.thumb : (videoId ? "https://i.ytimg.com/vi/" + videoId + "/mqdefault.jpg" : ""),
+      kind: matches ? cur.kind : "song",
+      // The queue's own length for this song wins whenever it has one: the
+      // player only knows as much of the song as it has streamed (0:49, then
+      // 1:1x, for a 3-minute song), and after a seek near the end it can
+      // report the NEXT song's stream instead (7:37 for a 2:16 song, the
+      // length of the entry queued behind it) while the song still ends at
+      // 2:16. The player's own value is only for a song the queue lacks.
+      duration: p && !ad
+        ? (matches && Number(cur.duration) > 0 ? Number(cur.duration) : Math.max(0, Number(p.getDuration()) || 0))
+        : 0,
+      position: p && !ad ? Math.max(0, Number(p.getCurrentTime()) || 0) : 0,
+      at: Date.now(),
+      playing: playing,
+      buffering: state === 3,
+      ended: state === 0,
+      ad: ad,
+      // The advert's own clock: the song's stays at 0 until it starts.
+      adPosition: ad && v ? Math.max(0, Number(v.currentTime) || 0) : 0,
+      adDuration: ad && v && isFinite(v.duration) ? Math.max(0, Number(v.duration) || 0) : 0,
+      // So the panel can grey the Skip pill instead of letting a press land
+      // on nothing: some adverts never grow a Skip button at all.
+      adSkippable: ad && !!adSkipButton(),
+      volume: p && typeof p.getVolume === "function" ? Math.round(Number(p.getVolume()) || 0) : 100,
+      muted: p && typeof p.isMuted === "function" ? !!p.isMuted() : false,
+      repeat: String(q.repeatMode || "NONE"),
+      shuffle: !!q.shuffleEnabled,
+      like: likeOf(st, videoId),
+      audioItag: ad ? "" : audioInfo(p),
+      index: typeof q.selectedItemIndex === "number" ? q.selectedItemIndex : -1,
+      canNext: (q.selectedItemIndex || 0) < items - 1 || automix > 0,
+      canPrev: videoId !== ""
+    }
+  }
+
+  function account() {
+    return { signedIn: signedIn(), premium: premium(), host: location.hostname, path: location.pathname }
+  }
+
+  // ---------------------------------------------------------------- EQ / loudness
+
+  // <video> -> preamp Gain -> 10 BiquadFilters (Settings > Sound's bands,
+  // same order as lib/Model.js's EQ_BAND_HZ: a 32 Hz lowshelf, eight peaking
+  // bands 64 Hz-8 kHz at Q~1.0, a 16 kHz highshelf) -> an optional
+  // DynamicsCompressor ("Even out loudness") -> destination.
+  //
+  // Built only once a setting actually needs it: flat gains, preamp 0 and
+  // loudness off never touch WebAudio at all (the cheapest path is no graph).
+  // Once built it stays built; "off"/flat from then on is just flat gains
+  // and no compressor sent through the same graph.
+  //
+  // The graph belongs to the document, not to this agent: once a <video>
+  // is wrapped in a MediaElementAudioSourceNode its audio only comes out
+  // through that node, and an element gets one for life. So the graph
+  // lives on window.__spinbloomEq, a newer agent injected into the same
+  // document (a Spinbloom update) takes it over, and stop() leaves it alone.
+  // Every element ever wrapped keeps its source connected to the preamp
+  // (a page that swaps its <video>, or goes back to an earlier one, is
+  // still heard, through the EQ); sources are found again through a
+  // WeakMap rather than made twice.
+  var EQ_FILTERS = [
+    { type: "lowshelf", freq: 32 },
+    { type: "peaking", freq: 64, q: 1.0 },
+    { type: "peaking", freq: 125, q: 1.0 },
+    { type: "peaking", freq: 250, q: 1.0 },
+    { type: "peaking", freq: 500, q: 1.0 },
+    { type: "peaking", freq: 1000, q: 1.0 },
+    { type: "peaking", freq: 2000, q: 1.0 },
+    { type: "peaking", freq: 4000, q: 1.0 },
+    { type: "peaking", freq: 8000, q: 1.0 },
+    { type: "highshelf", freq: 16000 }
+  ]
+
+  // { ctx, preamp, biquads, compressor, tail, sources: WeakMap<el, node> }
+  var eqGraph = window.__spinbloomEq && window.__spinbloomEq.ctx ? window.__spinbloomEq : null
+  var eqEl = null        // the element whose source is known to be in the graph
+  var eqApplied = null   // the last settings asked for: { bands, preamp, loudness }
+
+  function dbToGain(db) { return Math.pow(10, (Number(db) || 0) / 20) }
+
+  function isFlatEq(s) {
+    if (!s) return true
+    if (s.loudness) return false
+    if ((Number(s.preamp) || 0) !== 0) return false
+    var bands = s.bands || []
+    for (var i = 0; i < bands.length; i++) if ((Number(bands[i]) || 0) !== 0) return false
+    return true
+  }
+
+  // Connects (or reconnects) the tail of the filter chain to the
+  // compressor and destination, or straight to destination without it.
+  function wireOutput(loudness) {
+    var g = eqGraph
+    if (!g) return
+    try { g.tail.disconnect() } catch (e) { /* nothing connected yet */ }
+    try { g.compressor.disconnect() } catch (e) { /* nothing connected yet */ }
+    if (loudness) {
+      g.tail.connect(g.compressor)
+      g.compressor.connect(g.ctx.destination)
+    } else {
+      g.tail.connect(g.ctx.destination)
+    }
+  }
+
+  function buildGraph() {
+    var AC = window.AudioContext || window.webkitAudioContext
+    if (!AC) return null
+    var ctx = new AC()
+    var g = { ctx: ctx, preamp: ctx.createGain(), sources: new WeakMap() }
+    g.biquads = EQ_FILTERS.map(function (f) {
+      var b = ctx.createBiquadFilter()
+      b.type = f.type
+      b.frequency.value = f.freq
+      if (f.q) b.Q.value = f.q
+      return b
+    })
+    g.compressor = ctx.createDynamicsCompressor()
+    var node = g.preamp
+    g.biquads.forEach(function (b) { node.connect(b); node = b })
+    g.tail = node
+    window.__spinbloomEq = g
+    return g
+  }
+
+  // True once `el` plays through the graph. False (no EQ, the audio left
+  // as it is) when WebAudio is missing or the element cannot be wrapped.
+  function ensureGraph(el) {
+    if (eqEl === el && eqGraph) return true
+    try {
+      if (!eqGraph) {
+        eqGraph = buildGraph()
+        if (!eqGraph) return false
+        wireOutput(!!(eqApplied && eqApplied.loudness))
+      }
+      if (!eqGraph.sources.has(el)) {
+        var src = eqGraph.ctx.createMediaElementSource(el)
+        src.connect(eqGraph.preamp)
+        eqGraph.sources.set(el, src)
+      }
+      eqEl = el
+      return true
+    } catch (e) {
+      return false
+    }
+  }
+
+  // Applies `settings` to the graph, building it first if it is needed and
+  // not there yet. With no <video> yet the settings are kept and applied
+  // the moment bindVideo() sees one (start-up order: the agent can run
+  // before the app's player exists).
+  function applyEq(settings) {
+    eqApplied = settings
+    if (!eqGraph && isFlatEq(settings)) return false
+    var el = video()
+    if (!el) return false
+    if (!ensureGraph(el)) return false
+    var bands = settings.bands || []
+    eqGraph.preamp.gain.value = dbToGain(settings.preamp)
+    for (var i = 0; i < eqGraph.biquads.length; i++) eqGraph.biquads[i].gain.value = Number(bands[i]) || 0
+    wireOutput(!!settings.loudness)
+    return true
+  }
+
+  function parseEqArgs(args) {
+    var bands = args.bands
+    if (typeof bands === "string") { try { bands = JSON.parse(bands) } catch (e) { bands = [] } }
+    if (!Array.isArray(bands)) bands = []
+    return { bands: bands, preamp: Number(args.preamp) || 0, loudness: !!args.loudness }
+  }
+
+  // ---------------------------------------------------------------- push
+
+  var queueVersion = 0
+  var lastItems = null, lastAutomix = null, lastSelected = null, lastMore = null
+  var lastKey = ""
+  var lastSignedIn = null
+  var flushTimer = null
+  var seekPending = false
+  var unsubscribe = null
+  var boundVideo = null
+  var VIDEO_EVENTS = ["play", "pause", "playing", "waiting", "seeked", "durationchange", "volumechange", "ended", "emptied", "loadeddata", "ratechange"]
+
+  // Everything but the clock: a change here is worth a push.
+  function keyOf(s) {
+    return [s.videoId, s.title, s.playing, s.buffering, s.ended, s.ad, s.adSkippable, s.volume, s.muted, s.repeat, s.shuffle, s.like,
+      s.index, s.canNext, Math.round(s.duration), s.thumb, Math.round(s.adDuration)].join("\u0001")
+  }
+
+  function schedule(isSeek) {
+    if (isSeek) seekPending = true
+    if (flushTimer) return
+    flushTimer = setTimeout(flush, 60)
+  }
+
+  function flush() {
+    flushTimer = null
+    var s
+    try { s = snapshot() } catch (e) { return }
+    syncTrackLike(s.videoId)
+    var key = keyOf(s)
+    if (key !== lastKey || seekPending) {
+      lastKey = key
+      seekPending = false
+      emit("player", s)
+    }
+    var st = appState()
+    var q = st && st.queue
+    var more = continuationOf(app()) !== ""
+    if (q && (q.items !== lastItems || q.automixItems !== lastAutomix || q.selectedItemIndex !== lastSelected || more !== lastMore)) {
+      lastItems = q.items
+      lastAutomix = q.automixItems
+      lastSelected = q.selectedItemIndex
+      lastMore = more
+      queueVersion++
+      emit("queue", { version: queueVersion })
+    }
+    var si = signedIn() + ":" + premium()
+    if (si !== lastSignedIn) {
+      lastSignedIn = si
+      emit("account", account())
+    }
+    bindVideo()
+  }
+
+  function onVideoEvent(ev) { schedule(ev && ev.type === "seeked") }
+
+  function bindVideo() {
+    var v = video()
+    if (v === boundVideo) return
+    if (boundVideo) VIDEO_EVENTS.forEach(function (n) { boundVideo.removeEventListener(n, onVideoEvent) })
+    boundVideo = v || null
+    if (boundVideo) VIDEO_EVENTS.forEach(function (n) { boundVideo.addEventListener(n, onVideoEvent) })
+    // The page swapped its <video> (a real navigation): follow it, so a
+    // graph already built (or settings waiting for one) end up on the one
+    // actually playing.
+    if (boundVideo && eqApplied) applyEq(eqApplied)
+    else if (boundVideo && eqGraph) ensureGraph(boundVideo)   // taken over, no settings yet: keep the gains it has
+  }
+
+  // ---------------------------------------------------------------- navigation
+
+  // Change what plays the way the app's own links do: a `yt-navigate` event
+  // on the app. Same document, no page load, no window activation. A page
+  // load is the fallback only when the app did not react at all.
+  function navigate(endpoint) {
+    var a = app()
+    if (!a) fail("no-app")
+    a.dispatchEvent(new CustomEvent("yt-navigate", { bubbles: true, composed: true, detail: { endpoint: endpoint } }))
+  }
+
+  function watchUrl(w) {
+    var qs = []
+    if (w.videoId) qs.push("v=" + encodeURIComponent(w.videoId))
+    if (w.playlistId) qs.push("list=" + encodeURIComponent(w.playlistId))
+    return "/watch?" + qs.join("&")
+  }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms) }) }
+
+  // Resolves once the player or queue shows the request landed.
+  async function landed(before, wanted, waitMs) {
+    var end = Date.now() + waitMs
+    while (Date.now() < end) {
+      await sleep(100)
+      var p = player()
+      var st = appState()
+      var vid = p && p.getVideoData ? (p.getVideoData() || {}).video_id : ""
+      if (wanted && vid === wanted) return true
+      if (!wanted && st && st.queue && st.queue.items !== before.items) return true
+      if (location.href !== before.href && !wanted) return true
+    }
+    return false
+  }
+
+  async function play(args) {
+    var endpoint, wanted = args.videoId || ""
+    if (args.videoId) {
+      endpoint = { watchEndpoint: { videoId: args.videoId } }
+      if (args.playlistId) endpoint.watchEndpoint.playlistId = args.playlistId
+      if (args.params) endpoint.watchEndpoint.params = args.params
+      if (typeof args.index === "number") endpoint.watchEndpoint.index = args.index
+    } else if (args.playlistId) {
+      endpoint = { watchPlaylistEndpoint: { playlistId: args.playlistId } }
+      if (args.params) endpoint.watchPlaylistEndpoint.params = args.params
+    } else {
+      fail("bad-args")
+    }
+    var st = appState()
+    // A song from the playlist that is already the queue (a click in its
+    // page): select it in the queue, as the queue's own rows do. Loading the
+    // playlist again plays the song but leaves the queue's selection where
+    // it was, so the queue (and the player's CD wheel) points at the wrong
+    // song and the songs before this one seem to vanish.
+    if (args.videoId && args.playlistId && typeof args.index !== "number") {
+      var hit = queueEntryFor(st && st.queue, args.videoId, args.playlistId)
+      var a = app()
+      if (hit && a && a.queue && typeof a.queue.selectQueueItem === "function") {
+        a.queue.selectQueueItem(hit)
+        return { landed: "queue" }
+      }
+    }
+    var before = { items: st && st.queue ? st.queue.items : null, href: location.href }
+    navigate(endpoint)
+    if (await landed(before, wanted, wanted ? 4000 : 10000)) return { landed: "app" }
+    location.assign(watchUrl(args))
+    return { landed: "reload" }
+  }
+
+  // ---------------------------------------------------------------- queue
+
+  // Where the playing song sits in the queue (-1 when it is not there).
+  var mismatchSince = 0
+  function playingEntryIndex(q, videoId) {
+    if (!q || !Array.isArray(q.items)) return -1
+    for (var i = 0; i < q.items.length; i++) {
+      var t = P ? P.panelVideo(q.items[i]) : null
+      if (t && t.videoId === videoId) return i
+    }
+    return -1
+  }
+  function alignSelection(i) {
+    var s = store()
+    if (!s) return
+    mismatchSince = 0
+    if (s.getState().queue.selectedItemIndex !== i) s.dispatch({ type: "SET_INDEX", payload: i })
+  }
+
+  // The queue entry for this song, only when the queue is that playlist.
+  function queueEntryFor(q, videoId, playlistId) {
+    if (!q || !Array.isArray(q.items)) return null
+    for (var i = 0; i < q.items.length; i++) {
+      var t = P ? P.panelVideo(q.items[i]) : null
+      if (t && t.videoId === videoId && t.playlistId === playlistId) return q.items[i]
+    }
+    return null
+  }
+
+  function queueModel() {
+    var st = appState()
+    var q = st && st.queue
+    if (!q) return { items: [], automix: [], index: -1, more: false, version: queueVersion }
+    var map = function (list, offset) {
+      var out = []
+      for (var i = 0; i < (list || []).length; i++) {
+        var t = P ? P.panelVideo(list[i], { thumbPx: 120 }) : null
+        if (t) { t.queueIndex = offset + i; out.push(t) }
+      }
+      return out
+    }
+    return { items: map(q.items, 0), automix: map(q.automixItems, 0), index: q.selectedItemIndex,
+      more: continuationOf(app()) !== "", version: queueVersion }
+  }
+
+  // After MOVE_ITEM or REMOVE_ITEM the selection index points at whatever
+  // now sits there; point it back at the track that is playing.
+  function keepSelection(s, videoId) {
+    var q = s.getState().queue
+    for (var i = 0; i < q.items.length; i++) {
+      var t = P ? P.panelVideo(q.items[i]) : null
+      if (t && t.videoId === videoId) {
+        if (i !== q.selectedItemIndex) s.dispatch({ type: "SET_INDEX", payload: i })
+        return
+      }
+    }
+  }
+
+  // A queue edit, then the selection put back on the playing song: one
+  // step, so an armed recycle never mistakes the moment between for a new song.
+  var editing = false
+
+  function editQueue(s, action, playing) {
+    editing = true
+    try {
+      s.dispatch(action)
+      keepSelection(s, playing)
+    } finally {
+      editing = false
+    }
+    checkArmed()
+  }
+
+  function playingId() {
+    var p = player()
+    return p && p.getVideoData ? String((p.getVideoData() || {}).video_id || "") : ""
+  }
+
+  async function queueAdd(args) {
+    var s = needStore()
+    var res = await innertube("music/get_queue", { videoIds: args.videoIds })
+    var entries = P ? P.queueEntries(res) : []
+    if (!entries.length) fail("not-found")
+    var q = s.getState().queue
+    var before = q.items.length
+    var index = args.next ? Math.min(before, (q.selectedItemIndex || 0) + 1) : before
+    var playing = playingId()
+    editQueue(s, { type: "ADD_ITEMS", payload: { items: entries, index: index, nextQueueItemId: q.nextQueueItemId, shouldAssignIds: true } }, playing)
+    if (s.getState().queue.items.length !== before + entries.length) fail("unchanged")
+    return { added: entries.length, index: index }
+  }
+
+  function queueMove(args) {
+    var s = needStore()
+    var q = s.getState().queue
+    var n = q.items.length
+    if (args.from < 0 || args.from >= n || args.to < 0 || args.to >= n) fail("out-of-range")
+    if (args.from === args.to) return { moved: false }
+    var playing = playingId()
+    editQueue(s, { type: "MOVE_ITEM", payload: { fromIndex: args.from, toIndex: args.to } }, playing)
+    return { moved: true }
+  }
+
+  function queueRemove(args) {
+    var s = needStore()
+    var q = s.getState().queue
+    if (args.automix) {
+      if (args.index < 0 || args.index >= q.automixItems.length) fail("out-of-range")
+      s.dispatch({ type: "REMOVE_AUTOMIX_ITEM", payload: args.index })
+      return { removed: true }
+    }
+    if (args.index < 0 || args.index >= q.items.length) fail("out-of-range")
+    if (args.index === q.selectedItemIndex) fail("playing")
+    var playing = playingId()
+    editQueue(s, { type: "REMOVE_ITEM", payload: args.index }, playing)
+    return { removed: true }
+  }
+
+  async function queueJump(args) {
+    var s = needStore()
+    var a = app()
+    var q = s.getState().queue
+    var list = args.automix ? q.automixItems : q.items
+    if (args.index < 0 || args.index >= list.length) fail("out-of-range")
+    var entry = list[args.index]
+    if (a && a.queue && typeof a.queue.selectQueueItem === "function") {
+      a.queue.selectQueueItem(entry)
+    } else {
+      var t = P ? P.panelVideo(entry) : null
+      if (!t) fail("not-found")
+      navigate({ watchEndpoint: { videoId: t.videoId, playlistId: t.playlistId || undefined } })
+    }
+    return { jumped: true }
+  }
+
+  // ---------------------------------------------------------------- queue pages
+
+  // A long list (a playlist, shuffled or not, or a radio) reaches the queue
+  // one page at a time, about 50 songs. The token for the next page is kept
+  // by the app's queue service, not in the store, and the app asks for that
+  // page by itself only when the selection comes within 5 songs of the end.
+  function continuationOf(a) {
+    var c = a && a.queue ? a.queue.continuation : ""
+    return typeof c === "string" ? c : ""
+  }
+
+  // One more page, asked with the app's own token and added the way the app
+  // adds the pages it asks for: at the end of the queue, or of the autoplay
+  // list once that is what the list has become. While it is out, the app
+  // sees a request of its own in flight (pendingFetchItemsRequest, a promise
+  // with cancel() like its own): it does not ask for the same page again, a
+  // skip to the next song waits for it as it waits for its own, and a new
+  // list started meanwhile cancels it.
+  async function queueMore() {
+    var s = needStore()
+    var a = app()
+    var svc = a && a.queue
+    if (!svc) fail("no-queue")
+    var token = continuationOf(a)
+    if (!token) return { added: 0, more: false }
+    if (svc.pendingFetchItemsRequest) return { added: 0, more: true }   // that page is on its way already
+    var cancelled = false
+    var done = null
+    var pending = new Promise(function (r) { done = r })
+    pending.cancel = function () { cancelled = true }
+    svc.pendingFetchItemsRequest = pending
+    try {
+      var res = await innertube("next", { continuation: token, enablePersistentPlaylistPanel: true, isAudioOnly: true })
+      var page = P ? P.queuePage(res) : { entries: [], continuation: "" }
+      if (cancelled || continuationOf(a) !== token) return { added: 0, more: continuationOf(a) !== "" }
+      var q = s.getState().queue
+      svc.continuation = page.continuation || undefined
+      if (page.entries.length) {
+        if ((q.automixItems || []).length || q.hasShownAutoplay === true) {
+          s.dispatch({ type: "ADD_AUTOMIX_ITEMS", payload: { automixItems: page.entries, nextQueueItemId: q.nextQueueItemId, shouldAssignIds: true } })
+        } else {
+          s.dispatch({ type: "ADD_ITEMS", payload: { items: page.entries, index: q.items.length, nextQueueItemId: q.nextQueueItemId, shouldAssignIds: true } })
+        }
+      }
+      schedule(false)
+      return { added: page.entries.length, more: page.continuation !== "" }
+    } finally {
+      if (svc.pendingFetchItemsRequest === pending) svc.pendingFetchItemsRequest = null
+      done()
+    }
+  }
+
+  // ---------------------------------------------------------------- recycle
+
+  // The page grows while it is open (the app's own heap, about 30 MB an
+  // hour). The bridge swaps it for a fresh one at a quiet moment: it saves
+  // the session here, loads the app again, and gives the session back.
+
+  // The queue's plain fields and the store action that sets each one.
+  var QUEUE_SETTERS = {
+    autoplay: "SET_AUTOPLAY_ENABLED", header: "SET_HEADER", isInfinite: "SET_IS_INFINITE",
+    playbackContentMode: "SET_PLAYBACK_CONTENT_MODE", queueContextParams: "SET_QUEUE_CONTEXT_PARAMS",
+    repeatMode: "SET_REPEAT", shuffleEnabled: "SET_SHUFFLE_ENABLED", shuffleEndpoints: "SET_SHUFFLE_ENDPOINTS",
+    watchNextType: "SET_WATCH_NEXT_TYPE"
+  }
+
+  // Armed, the next song is paused the moment it is selected, before it
+  // makes a sound, and the bridge is told: that song boundary is the quiet
+  // moment of a page that is playing.
+  // (A queue edit moves the index too, but not to another song.) An arm
+  // lasts a short while and the bridge renews it: a bridge that is gone
+  // must not leave a trap that stops the music at the next song.
+  var armedOn = null   // the song selected when armed
+  var armedUntil = 0
+
+  function selectedId() {
+    var cur = currentEntry((appState() || {}).queue)
+    return cur ? cur.videoId : ""
+  }
+
+  function checkArmed() {
+    if (armedOn === null || editing) return
+    if (Date.now() > armedUntil) { armedOn = null; return }
+    var id = selectedId()
+    if (!id || id === armedOn) return
+    armedOn = null
+    var p = player()
+    if (p) p.pauseVideo()
+    emit("recycle", { videoId: id })
+  }
+
+  function saveSession() {
+    var q = needStore().getState().queue
+    var p = needPlayer()
+    var out = {
+      items: q.items, automixItems: q.automixItems || [], selectedItemIndex: q.selectedItemIndex,
+      nextQueueItemId: q.nextQueueItemId || 0,
+      videoId: selectedId() || playingId(), position: Math.max(0, Number(p.getCurrentTime()) || 0),
+      playing: p.getPlayerState() === 1,
+      volume: Math.round(Number(p.getVolume()) || 0), muted: !!(p.isMuted && p.isMuted()),
+      // Without it the fresh page never asks for the next page of a long
+      // list: the queue would end with the songs it has.
+      continuation: continuationOf(app())
+    }
+    Object.keys(QUEUE_SETTERS).forEach(function (k) { if (k in q) out[k] = q[k] })
+    return out
+  }
+
+  function sameItems(a, b) {
+    if (!a || !b || a.length !== b.length) return false
+    for (var i = 0; i < a.length; i++) {
+      var x = P ? P.panelVideo(a[i]) : null
+      var y = P ? P.panelVideo(b[i]) : null
+      if (!x || !y || x.videoId !== y.videoId) return false
+    }
+    return true
+  }
+
+  function putQueue(s, saved) {
+    var next = Number(saved.nextQueueItemId) || 0
+    // CLEAR is the one action that sets the next queue id: to one past the
+    // largest index it keeps (none here: the fresh page's queue is empty).
+    s.dispatch(next > 0 ? { type: "CLEAR", payload: [next - 1] } : { type: "CLEAR" })
+    s.dispatch({ type: "RESET_ITEMS", payload: saved.items })
+    s.dispatch({ type: "REPLACE_AUTOMIX_ITEMS", payload: { automixItems: saved.automixItems || [], shouldAssignIds: false } })
+    // The app's reducers are picky about some values (a content mode it
+    // does not know throws): one setting it refuses must not cost the rest
+    // of the session, and the song's own load sets it again.
+    Object.keys(QUEUE_SETTERS).forEach(function (k) {
+      if (!(k in saved)) return
+      try { s.dispatch({ type: QUEUE_SETTERS[k], payload: saved[k] }) } catch (e) { /* keep the rest */ }
+    })
+    s.dispatch({ type: "SET_INDEX", payload: saved.selectedItemIndex })
+  }
+
+  // The token goes back last, once the queue is in place: set any earlier,
+  // the song's load could fetch a page that the saved items then overwrite,
+  // and the queue would skip it.
+  function putContinuation(s, a, saved) {
+    if (!a || !a.queue) return
+    a.queue.continuation = typeof saved.continuation === "string" && saved.continuation ? saved.continuation : undefined
+    if (!a.queue.continuation) return
+    // The app asks for the next page when the selection comes within 5
+    // songs of the end. If the saved song is already there, the old page's
+    // request went with it: ask now, or the queue stops at its last song.
+    var q = s.getState().queue
+    if (q.selectedItemIndex + 5 >= q.items.length + (q.automixItems || []).length) queueMore().catch(function () {})
+  }
+
+  async function restoreSession(saved) {
+    var s = needStore()
+    var p = needPlayer()
+    var a = app()
+    if (!Array.isArray(saved.items)) fail("bad-args")
+    putQueue(s, saved)
+    var i = saved.selectedItemIndex
+    if (typeof i !== "number" || i < 0 || i >= saved.items.length || !a || !a.queue ||
+        typeof a.queue.selectQueueItem !== "function") {
+      putContinuation(s, a, saved)
+      return { restored: "queue" }
+    }
+    // Load the song muted when it is to stay paused: selecting it plays it.
+    p.setVolume(saved.volume)
+    s.dispatch({ type: "SET_VOLUME", payload: saved.volume })
+    var quiet = !saved.playing || saved.muted
+    if (quiet) p.mute()
+    a.queue.selectQueueItem(saved.items[i])
+    var ok = false
+    // Up to 15 s, and as long as the right song is still buffering (a slow
+    // network is not a failed restore: giving up skips the seek and the pause).
+    var limit = 60
+    for (var n = 0; n < limit; n++) {
+      await sleep(250)
+      if (n === limit - 1 && limit < 240 && playingId() === saved.videoId && p.getPlayerState() === 3) limit++
+      if (playingId() === saved.videoId && p.getPlayerState() === 1) { ok = true; break }
+      // The app sometimes loads the song and leaves it cued (unstarted),
+      // for ever: it only starts when told to (still muted when it is to stay paused).
+      if (n >= 4 && playingId() === saved.videoId && (p.getPlayerState() === -1 || p.getPlayerState() === 5)) p.playVideo()
+    }
+    if (ok && saved.position > 1) p.seekTo(saved.position, true)
+    if (!saved.playing) p.pauseVideo()
+    if (!saved.muted) {
+      if (!saved.playing) await sleep(300)
+      p.unMute()
+      s.dispatch({ type: "SET_MUTED", payload: false })
+    } else {
+      s.dispatch({ type: "SET_MUTED", payload: true })
+    }
+    // Selecting a song asks the server what comes next, which may rewrite
+    // the rest of the queue: put the saved one back.
+    await sleep(1500)
+    if (!sameItems(s.getState().queue.items, saved.items)) {
+      var keep = s.getState().queue.automixItems
+      s.dispatch({ type: "RESET_ITEMS", payload: saved.items })
+      s.dispatch({ type: "SET_INDEX", payload: i })
+      if (!(keep && keep.length)) s.dispatch({ type: "REPLACE_AUTOMIX_ITEMS", payload: { automixItems: saved.automixItems || [], shouldAssignIds: false } })
+    } else if ((s.getState().queue.automixItems || []).length > (saved.automixItems || []).length) {
+      // The song's load appended a fresh continuation to the saved one: left
+      // alone, the list grows by one page (50 songs) at every recycle.
+      s.dispatch({ type: "REPLACE_AUTOMIX_ITEMS", payload: { automixItems: saved.automixItems || [], shouldAssignIds: false } })
+    }
+    putContinuation(s, a, saved)
+    schedule(false)
+    return { restored: ok ? "song" : "queue" }
+  }
+
+  // ---------------------------------------------------------------- operations
+
+  var FILTERS = P ? P.SEARCH_FILTERS : {}
+
+  var LIBRARY = {
+    playlists: "FEmusic_liked_playlists",
+    songs: "VLLM",
+    albums: "FEmusic_liked_albums",
+    artists: "FEmusic_library_corpus_track_artists",
+    history: "FEmusic_history"
+  }
+  // How long the library op may spend on the pages after the first one:
+  // well inside the bridge's 45 s for the op, the first page included.
+  var LIBRARY_PAGING_MS = 30000
+
+  var ops = {
+    ping: function () { return { version: VERSION, host: location.hostname } },
+
+    state: function () {
+      return { player: snapshot(), account: account(), queueVersion: queueVersion }
+    },
+
+    transport: function (args) {
+      var p = needPlayer()
+      var v = video()
+      switch (args.action) {
+        case "play": p.playVideo(); break
+        case "pause": p.pauseVideo(); break
+        case "toggle":
+          if (p.getPlayerState() === 1 || (v && !v.paused)) p.pauseVideo()
+          else p.playVideo()
+          break
+        case "next": p.nextVideo(); break
+        case "previous":
+          // Like every player: restart the song unless it just started.
+          if ((Number(p.getCurrentTime()) || 0) > 5) p.seekTo(0, true)
+          else p.previousVideo()
+          break
+        default: fail("bad-args")
+      }
+      schedule(false)
+      return { done: true }
+    },
+
+    seek: function (args) {
+      var p = needPlayer()
+      var d = Number(p.getDuration()) || 0
+      var t = Math.max(0, Math.min(args.seconds, d > 1 ? d - 1 : args.seconds))
+      p.seekTo(t, true)
+      schedule(true)
+      return { position: t }
+    },
+
+    volume: function (args) {
+      var p = needPlayer()
+      var s = store()
+      p.setVolume(args.level)
+      if (s) s.dispatch({ type: "SET_VOLUME", payload: args.level })
+      if (args.level > 0 && p.isMuted && p.isMuted()) {
+        p.unMute()
+        if (s) s.dispatch({ type: "SET_MUTED", payload: false })
+      }
+      schedule(false)
+      return { volume: Math.round(p.getVolume()) }
+    },
+
+    mute: function (args) {
+      var p = needPlayer()
+      var s = store()
+      if (args.muted) p.mute(); else p.unMute()
+      if (s) s.dispatch({ type: "SET_MUTED", payload: !!args.muted })
+      schedule(false)
+      return { muted: !!p.isMuted() }
+    },
+
+    repeat: function (args) {
+      var s = needStore()
+      s.dispatch({ type: "SET_REPEAT", payload: args.mode })
+      schedule(false)
+      return { repeat: String(s.getState().queue.repeatMode || "") }
+    },
+
+    // The advert's own Skip button, pressed when the user asks. The ad
+    // watcher (see start()) also presses it by itself every second; this
+    // stays for the panel's pill, which says when it cannot be skipped yet.
+    "ad.skip": function () {
+      var b = adSkipButton()
+      if (!b) fail("not-skippable")
+      pressSkip(b)
+      return { skipped: true }
+    },
+
+    shuffle: function () {
+      var a = app()
+      if (!a || !a.queue || typeof a.queue.shuffle !== "function") fail("no-queue")
+      a.queue.shuffle()
+      schedule(false)
+      return { shuffled: true }
+    },
+
+    play: play,
+
+    radio: function (args) {
+      if (args.playlistId) return play({ videoId: args.videoId || "", playlistId: args.playlistId, params: args.params || "wAEB" })
+      return play({ videoId: args.videoId, playlistId: "RDAMVM" + args.videoId, params: "wAEB" })
+    },
+
+    search: async function (args) {
+      var body = { query: args.q }
+      if (args.filter) body.params = decodeURIComponent(FILTERS[args.filter])
+      if (args.continuation) body = { continuation: args.continuation }
+      var data = await innertube("search", body, { timeout: 15000 })
+      return P.search(data, { filter: args.filter || "" })
+    },
+
+    suggest: async function (args) {
+      return { suggestions: P.suggestions(await innertube("music/get_search_suggestions", { input: args.q })) }
+    },
+
+    browse: async function (args) {
+      var body = args.continuation ? { continuation: args.continuation } : { browseId: args.id }
+      if (args.params && !args.continuation) body.params = args.params
+      var data = await innertube("browse", body, { timeout: 15000 })
+      return P.browse(args.id, data)
+    },
+
+    home: async function () {
+      return P.browse("FEmusic_home", await innertube("browse", { browseId: "FEmusic_home" }, { timeout: 15000 }))
+    },
+
+    library: async function (args) {
+      needSignIn()
+      var id = LIBRARY[args.section]
+      var data = await innertube("browse", { browseId: id }, { timeout: 15000 })
+      var out = P.browse(id, data)
+      // The library pages list only their first 25 rows; the rest page
+      // behind the grid's continuation. Follow it to the end (a bad token
+      // yields no rows and stops the loop), de-duplicating as pages go.
+      if (Array.isArray(out.sections)) {
+        var seen = {}
+        var s, k, key0
+        for (s = 0; s < out.sections.length; s++) {
+          var first = out.sections[s].items || []
+          for (k = 0; k < first.length; k++) {
+            key0 = first[k] && (first[k].videoId || first[k].browseId || first[k].playlistId)
+            if (key0) seen[key0] = true
+          }
+        }
+        var token = P.gridToken(data)
+        var pages = 0
+        // The rest is a bonus on top of the first page: a page that fails,
+        // or a library too big to page within the bridge's own deadline
+        // for this op (45 s), keeps the rows already there instead of
+        // failing the whole section.
+        var deadline = Date.now() + LIBRARY_PAGING_MS
+        while (token && pages < 50) {
+          var left = deadline - Date.now()
+          if (left < 1000) break
+          pages += 1
+          var more
+          try { more = await innertube("browse", { continuation: token }, { timeout: Math.min(15000, left) }) } catch (e) { break }
+          var page = P.gridPage(more, { thumbPx: 240 })
+          var fresh = []
+          for (var i = 0; i < page.items.length; i++) {
+            var it = page.items[i]
+            var key = it.videoId || it.browseId || it.playlistId
+            if (!key || seen[key]) continue
+            seen[key] = true
+            fresh.push(it)
+          }
+          if (!fresh.length) break
+          if (!out.sections.length) out.sections.push({ title: "", items: [] })
+          var shelf = out.sections[out.sections.length - 1]
+          shelf.items = (shelf.items || []).concat(fresh)
+          token = page.continuation
+        }
+      }
+      return out
+    },
+
+    queue: function () { return queueModel() },
+    "session.save": function () { return saveSession() },
+    "session.restore": function (args) { return restoreSession(args) },
+    "session.arm": function (args) {
+      needStore()
+      if (!args.armed) armedOn = null
+      else if (armedOn === null) armedOn = selectedId()
+      armedUntil = Date.now() + 1000 * (args.ttl || 90)
+      return { armed: armedOn !== null }
+    },
+    "queue.add": queueAdd,
+    "queue.move": queueMove,
+    "queue.remove": queueRemove,
+    "queue.jump": queueJump,
+    "queue.more": queueMore,
+
+    like: async function (args) {
+      needSignIn()
+      var ep = args.status === "LIKE" ? "like/like" : args.status === "DISLIKE" ? "like/dislike" : "like/removelike"
+      var accountId = likeAccount()
+      likeRevision++
+      likeWrites++
+      try {
+        await innertube(ep, { target: { videoId: args.videoId } })
+      } finally {
+        likeWrites--
+      }
+      if (stopped || likeAccount() !== accountId) return { like: args.status }
+      if (likeSession !== accountId) {
+        likeSession = accountId
+        likeCache = Object.create(null)
+      }
+      likeCache[args.videoId] = args.status
+      var s = store()
+      if (s) s.dispatch({ type: "SET_VIDEO_LIKE_STATUS", payload: { id: args.videoId, status: args.status } })
+      schedule(false)
+      return { like: args.status }
+    },
+
+    lyrics: async function (args) {
+      var info = P.watchInfo(await innertube("next", { videoId: args.videoId, isAudioOnly: true }))
+      if (!info.lyricsId) return { kind: "none", lines: [], text: "", source: "" }
+      var timed = null
+      try { timed = await innertube("browse", { browseId: info.lyricsId }, { mobile: true }) } catch (e) { timed = null }
+      var out = P.lyrics(timed, null)
+      if (out.kind === "timed") return out
+      return P.lyrics(null, await innertube("browse", { browseId: info.lyricsId }))
+    },
+
+    "playlist.create": async function (args) {
+      needSignIn()
+      var body = { title: args.title, privacyStatus: "PRIVATE" }
+      if (args.videoIds && args.videoIds.length) body.videoIds = args.videoIds
+      var res = await innertube("playlist/create", body)
+      if (!res || !res.playlistId) fail("failed")
+      return { playlistId: String(res.playlistId) }
+    },
+
+    // The "Save to playlist" dialog's list: the playlists this song can go
+    // in. The reply does not say which of them have it already.
+    "playlist.options": async function (args) {
+      needSignIn()
+      return P.addToPlaylist(await innertube("playlist/get_add_to_playlist", { videoIds: [args.videoId], excludeWatchLater: false }))
+    },
+
+    // DEDUPE_OPTION_CHECK is what the dialog sends: a song already in the
+    // playlist is refused (`duplicate`). `force` is its "Add anyway"
+    // (DEDUPE_OPTION_SKIP, which skips the check and adds it twice).
+    "playlist.add": async function (args) {
+      needSignIn()
+      var res = await innertube("browse/edit_playlist", {
+        playlistId: args.playlistId,
+        actions: [{ action: "ACTION_ADD_VIDEO", addedVideoId: args.videoId, dedupeOption: args.force ? "DEDUPE_OPTION_SKIP" : "DEDUPE_OPTION_CHECK" }]
+      })
+      var outcome = P.playlistEditResult(res)
+      if (outcome === "failed") fail("failed")
+      return outcome === "added" ? { added: true } : { added: false, duplicate: true }
+    },
+
+    "eq.set": function (args) {
+      var on = applyEq(parseEqArgs(args))
+      return { applied: true, built: on }
+    },
+
+    "account.info": async function () {
+      needSignIn()
+      return P.accountInfo(await innertube("account/account_menu", {}))
+    }
+  }
+
+  async function call(op, args) {
+    if (location.hostname !== HOST) fail("not-on-app")
+    var fn = Object.prototype.hasOwnProperty.call(ops, op) ? ops[op] : null
+    if (!fn) fail("unknown-op")
+    return await fn(args || {})
+  }
+
+  // ---------------------------------------------------------------- start
+
+  var startTimer = null
+  var adSkipTimer = null
+
+  function stop() {
+    stopped = true
+    if (startTimer) clearTimeout(startTimer)
+    if (adSkipTimer) clearInterval(adSkipTimer)
+    adSkipTimer = null
+    if (flushTimer) clearTimeout(flushTimer)
+    if (unsubscribe) { try { unsubscribe() } catch (e) { /* store gone */ } }
+    if (boundVideo) VIDEO_EVENTS.forEach(function (n) { boundVideo.removeEventListener(n, onVideoEvent) })
+    boundVideo = null
+    unsubscribe = null
+    // The EQ graph stays: the <video> plays through it (see window.__spinbloomEq).
+  }
+
+  // On a new document the agent runs before the app exists: wait for it.
+  // This loop ends when the app is up (or after 90 s).
+  function start(tries) {
+    if (location.hostname !== HOST) {
+      emit("account", account())
+      return
+    }
+    var s = store()
+    if (!s || !player() || !cfg("INNERTUBE_CONTEXT")) {
+      if (tries < 360) startTimer = setTimeout(function () { start(tries + 1) }, 250)
+      else emit("error", { code: "app-not-found" })
+      return
+    }
+    unsubscribe = s.subscribe(function () { checkArmed(); schedule(false) })
+    bindVideo()
+    if (!adSkipTimer) adSkipTimer = setInterval(function () {
+      autoSkipAd()
+      syncTrackLike(playingId())
+    }, AD_SKIP_MS)
+    if (fromUnsharedAgent && !eqGraph) {
+      fromUnsharedAgent = false
+      var el = video()
+      // Wrapping it fails only if the old agent had: then only a fresh page
+      // brings the sound back, and the bridge swaps it for one.
+      if (el && !ensureGraph(el)) emit("eq-lost", {})
+    }
+    lastSignedIn = null
+    emit("hello", { version: VERSION, account: account() })
+    flush()
+  }
+
+  window.__spinbloom = { version: VERSION, call: call, stop: stop, sharesEq: true }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { start(0) }, { once: true })
+  else start(0)
+})()

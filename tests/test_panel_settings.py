@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Settings replaces the whole panel: the real Panel.qml, settings open.
+
+Renders tests/qml/PanelScene.qml (the real Panel.qml, its real views, with a
+fake service) in a private Quickshell, offscreen. The shell's KeyboardPanel
+(a layer-shell window that takes the keyboard) is swapped for
+tests/qml/stub/KeyboardPanel.qml, a plain card: nothing is mapped on the
+desktop and no keyboard is grabbed. Skips when Quickshell, the Omarchy
+shell or a desktop session is missing.
+"""
+import testenv  # noqa: F401 - isolates HOME/XDG_*/SPINBLOOM_* before anything else runs
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+SHELL_DIR = os.path.join(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"), "shell")
+QS = shutil.which(os.environ.get("QS_TOOL", "qs"))
+
+
+def render(workdir, scale="1", out=None):
+    cfg = os.path.join(workdir, "scene")
+    ui = os.path.join(cfg, "Ui")
+    os.makedirs(ui)
+    # The shell's Ui module, file by file, with KeyboardPanel.qml swapped.
+    shell_ui = os.path.join(SHELL_DIR, "Ui")
+    for name in os.listdir(shell_ui):
+        src = os.path.join(HERE, "qml", "stub", name) if name == "KeyboardPanel.qml" else os.path.join(shell_ui, name)
+        os.symlink(src, os.path.join(ui, name))
+    for name, target in (("Commons", os.path.join(SHELL_DIR, "Commons")),
+                         ("views2", os.path.join(ROOT, "views2")), ("theme2", os.path.join(ROOT, "theme2")), ("GlassBlur.qml", os.path.join(ROOT, "GlassBlur.qml")), ("MiniPlayer2.qml", os.path.join(ROOT, "MiniPlayer2.qml")), ("Panel2.qml", os.path.join(ROOT, "Panel2.qml")), ("ArtworkPopup2.qml", os.path.join(ROOT, "ArtworkPopup2.qml")), ("LibraryPopup2.qml", os.path.join(HERE, "qml", "stub", "LibraryPopup2.qml")), ("lib", os.path.join(ROOT, "lib")),
+                         ("SpinbloomPanel.qml", os.path.join(ROOT, "Panel2.qml")),
+                         ("shell.qml", os.path.join(HERE, "qml", "PanelScene.qml"))):
+        os.symlink(target, os.path.join(cfg, name))
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_SCALE_FACTOR=scale, XDG_RUNTIME_DIR=workdir)
+    env.pop("SPINBLOOM_SCENE_OUT", None)
+    if out:
+        env["SPINBLOOM_SCENE_OUT"] = out
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    display = os.environ.get("WAYLAND_DISPLAY", "")
+    if runtime and display and not os.path.isabs(display):
+        env["WAYLAND_DISPLAY"] = os.path.join(runtime, display)
+    run = subprocess.run([QS, "-p", os.path.join(cfg, "shell.qml"), "--no-color"], env=env,
+                         capture_output=True, text=True, timeout=60)
+    m = re.search(r"STATE (\{.*\})", run.stdout + run.stderr)
+    return {"STATE": json.loads(m.group(1)) if m else None, "log": (run.stdout + run.stderr)[-3000:]}
+
+
+@unittest.skipUnless(QS and os.path.isdir(os.path.join(SHELL_DIR, "Ui")) and os.environ.get("WAYLAND_DISPLAY"),
+                     "Quickshell, the Omarchy shell or a desktop session is missing")
+class PanelSettings(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workdir = tempfile.mkdtemp(prefix="spinbloom-panel-")
+        cls.found = render(cls.workdir, os.environ.get("SPINBLOOM_SCENE_SCALE", "1"), os.environ.get("SPINBLOOM_PANEL_OUT"))
+        cls.state = cls.found["STATE"]
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.workdir, ignore_errors=True)
+
+    def setUp(self):
+        self.assertIsNotNone(self.state, "the scene did not render:\n" + self.found["log"])
+
+    def test_closed_settings_show_the_normal_panel(self):
+        self.assertEqual(self.state["closed"], {"hero": True, "tabs": True, "settings": False})
+
+    def test_settings_replace_the_whole_body(self):
+        s = self.state["open"]
+        self.assertFalse(s["hero"], "no now-playing hero or transport under Settings")
+        self.assertFalse(s["tabs"], "no tabs under Settings")
+        self.assertTrue(s["settings"])
+        self.assertTrue(s["brand"], "the brand corner (gear, power) stays")
+
+    def test_the_back_row_sits_on_the_top_row_with_the_brand_corner(self):
+        s = self.state["open"]
+        self.assertTrue(s["back"])
+        self.assertLessEqual(s["backTop"], s["brandTop"] + 24, s)
+        self.assertLessEqual(abs(s["backMid"] - s["brandMid"]), 8, s)
+
+    def test_off_shows_only_the_way_back_on(self):
+        s = self.state["off"]
+        self.assertEqual({k: s[k] for k in ("offCard", "turnOn", "tabs", "hero")},
+                         {"offCard": True, "turnOn": True, "tabs": False, "hero": True})
+
+    def test_enter_turns_spinbloom_on_when_off(self):
+        self.assertEqual(self.state["off"]["startsAfterEnter"], 1)
+
+    def test_keys_do_nothing_while_signing_in(self):
+        # A key that lands in the panel while Google's window is open (or
+        # hidden, saving the sign-in) neither cancels it nor opens another.
+        self.assertEqual(self.state["signing"]["calls"], [])
+
+    def test_esc_brings_the_panel_back(self):
+        self.assertEqual(self.state["afterEsc"], {"hero": True, "tabs": True, "settings": False})
+
+
+class PanelFooterSource(unittest.TestCase):
+    def test_a_footer_message_never_has_hints_drawn_over_it(self):
+        # A message ("YouTube Music is not ready yet") shares the footer's
+        # strip with the key hints: showing both drew one over the other.
+        # Spinbloom keeps the footer for messages only: both hint rows (the
+        # views' and Settings') stay hidden; keys are one "?" away.
+        with open(os.path.join(ROOT, "Panel2.qml")) as f:
+            src = f.read()
+        self.assertIn('visible: root.flash !== ""', src)
+        settings_row = src[src.index("Settings has its own, fixed hints"):]
+        settings_row = settings_row[:settings_row.index("Repeater")]
+        self.assertIn("visible: false", settings_row)
+        views_row = src[:src.index("Settings has its own, fixed hints")]
+        views_row = views_row[views_row.rindex("Row {"):]
+        self.assertIn("visible: false", views_row)
+
+
+if __name__ == "__main__":
+    unittest.main()
