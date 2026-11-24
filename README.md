@@ -42,6 +42,7 @@ Spinbloom builds on that wonderful work with the idea of a player that's familia
 - **Omarchy 4.5 or newer**, with shell plugins (`omarchy plugin --help` works). Spinbloom is built and tested on Omarchy 4.5; it hasn't been tried on earlier versions. Check yours with `omarchy version`.
 - **A Chromium-based browser** in its usual place: Chromium (Omarchy's default), Google Chrome, Brave, Vivaldi or Microsoft Edge.
 - **Python 3** (`/usr/bin/python3`), **Hyprland** and a `systemd --user` session. Omarchy has all three.
+- A few small desktop tools that Omarchy also includes: `pactl` and `pw-metadata` (PipeWire, for Play music on), `wl-copy` (Copy song link) and `notify-send` (song notifications).
 
 ## Install
 
@@ -121,7 +122,7 @@ Without Premium, YouTube Music plays adverts. Spinbloom presses an advert's own 
 
 ## Privacy and security
 
-Spinbloom only connects to YouTube Music, Google sign-in and YouTube's image servers. It has no analytics or tracking, needs no admin rights, and never edits your Hyprland or other config files; its own settings live in its entry in Omarchy's `shell.json`. [SECURITY.md](SECURITY.md) lists everything it runs, stores and changes.
+Spinbloom only connects to YouTube Music, Google sign-in and YouTube's image servers. It has no analytics or tracking, needs no admin rights, and never edits your Hyprland or other config files; its own settings live in its entry in Omarchy's `shell.json`. If Hyprland's blur is off, Spinbloom turns it on for panels while it runs, so its glass is frosted; that is a live setting only, and you can turn it off in Settings → Appearance → Use desktop blur. [SECURITY.md](SECURITY.md) lists everything it runs, stores and changes.
 
 ## For the curious
 

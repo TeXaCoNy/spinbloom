@@ -11,10 +11,10 @@ Spinbloom is a music player for the Omarchy shell. This page lists everything it
 - **Standard desktop tools**, always called with fixed program paths and separate arguments, never through a shell with outside text in it:
   - `hyprctl` (window rules, keyboard shortcuts),
   - `notify-send` (song notifications),
-  - `pactl` (the "Play music on" device picker),
+  - `pactl` and `pw-metadata` (the "Play music on" device picker),
   - `wl-copy` ("Copy song link").
 
-Spinbloom never asks for `sudo` or other admin rights, and never downloads or runs code from the internet.
+No `sudo` or `pkexec` is required: Spinbloom never asks for admin rights, and never downloads or runs code from the internet.
 
 ## What it connects to
 
@@ -47,7 +47,7 @@ Everything below is set while Hyprland runs and is never written into your Hyprl
 - **Keyboard shortcuts:** Super+Alt+M (player), Super+Alt+P (play/pause), Super+Alt+N (next), Super+Alt+B (previous) and Super+Alt+L (like).
   - A key another app already uses is never taken; Spinbloom uses its next choice instead.
   - The shortcuts are removed when the plugin is removed, and you can turn them off with the `globalKeys` setting.
-- **"Use desktop blur"** (Settings → Appearance) is **off by default**. When you turn it on, it switches on Hyprland blur for panels only (app windows are left unblurred). Turning it off switches it back.
+- **"Use desktop blur"** (Settings → Appearance) is **on by default**, so the player's frosted glass works straight away. If Hyprland's blur is off, Spinbloom switches it on for panels only (app windows are left unblurred) while it runs. If your own Hyprland config already uses blur, Spinbloom leaves it alone. Turn the setting off and it switches blur back off.
 
 Spinbloom never touches another plugin's files. If **Solfa**, the player Spinbloom is based on, is installed too, both run side by side and Spinbloom leaves Solfa's folders alone.
 
